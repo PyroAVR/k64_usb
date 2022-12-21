@@ -8,20 +8,14 @@ local_headers = ['include']
 
 # List of C sources to compile. Relative to project root.
 c_sources = [
-    'src/kernel/hardfault.c',
-    'src/kernel/kernel_support.c',
-    'src/kernel/environment.c',
-    'src/kernel/abort.c',
-    'src/kernel/sbrk.c',
-    'src/nongnu/unistd.c',
-    'src/drivers/uart.c',
-    'src/programs/dma.c'
+    'src/status_leds.c',
+    'src/hardfault.c',
+    'src/systick.c',
+    'src/main.c'
 ]
 
 # List of ASM sources to compile.  Relative to project root.
 asm_sources = [
-    'src/asmlib/queue.s',
-    'src/asmlib/uart_driver.s'
 ]
 
 ## project setup
@@ -62,7 +56,7 @@ main = executable(
 )
 main_binary = custom_target(
     'main.bin',
-    command: ['@SOURCE_DIR@/scripts/create_bin.sh', 'main.elf', '@OUTPUT@'],
+    command: [meson.source_root() / 'scripts/create_bin.sh', 'main.elf', '@OUTPUT@'],
     depends: main,
     output: 'main.bin',
     build_by_default: true
