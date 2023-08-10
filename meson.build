@@ -37,6 +37,10 @@ asm_sources = asm_sources + ['core/src/startup_MK64F12.S']
 _includes = local_headers + ['core/include']
 _incl_dirs = include_directories(_includes)
 
+add_project_link_arguments(['-Wl,-Map=main.map'], language: 'c')
+add_project_arguments(['-g3'], language: 'c')
+add_project_arguments(['-D__STARTUP_CLEAR_BSS'], language: 'c')
+
 asm_static_object = static_library(
     'asm_static_object',
     asm_sources,

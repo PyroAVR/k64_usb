@@ -96,42 +96,6 @@ typedef struct __attribute__((packed)) usbfs_bd_S {
 	uint32_t   buf_addr;
 } usb_bd_t;
 
-/*
- *typedef struct __attribute__((packed)) usbfs_bd_S {
- *    union {
- *        struct {
- *            uint8_t rsvd1:2;
- *            // buffer stall request
- *            uint8_t bdt_stall:1;
- *            // data toggle sync (data0/data1??)
- *            uint8_t dts:1;
- *            // no-increment (fifo mode, for isochronous endpoints)
- *            uint8_t ninc:1;
- *            // set this and own to 1 for isochronous (udp on schedule) endpoints.
- *            uint8_t keep:1;
- *            // data0 or data1 transferred to/from this endpoint next.
- *            uint8_t data01:1;
- *            // whether the buffer / bdt is owned by usbfs
- *            uint8_t own:1;
- *        } ctrl;
- *        struct {
- *            uint8_t rsvd2:2;
- *            uint8_t tok_pid:4;
- *            // unused for addressing the pid
- *            uint8_t rsvd3:2;
- *        } pid;
- *        uint8_t raw;
- *    };
- *    uint8_t rsvd4;
- *    // size of buffer (max 1024 per usb spec.)
- *    union {
- *        uint16_t byte_count:10;
- *        uint16_t bc:10;
- *    } __attribute__((packed));
- *    uint8_t rsvd5:6;
- *    uint32_t buffer_address;
- *} usb_bd_t;
- */
 
 typedef union {
     struct __attribute__((packed)){
@@ -147,12 +111,17 @@ typedef union {
 usb_bd_t usb_endpoints[4] __attribute__((aligned(512))) = {0};
 
 // good thing we have plenty of ram :)
-const char ep0_buf[4][128];
+char ep0_buf[4][128] = {0};
 
 int main(void) {
     asm("cpsid i");
     systick_init(32000, 1, 1, 1);
     status_leds_init();
+
+    SCB->SHCSR |= (SCB_SHCSR_MEMFAULTENA_Msk | SCB_SHCSR_BUSFAULTENA_Msk | SCB_SHCSR_USGFAULTENA_Msk);
+
+    // forcibly toggle USBFS power to ensure sane debugging
+    SIM->SCGC4 &= ~SIM_SCGC4_USBOTG_MASK;
 
     // use USB 48MHz ref clock for PLL/FLL
     SIM->SOPT2 |= (SIM_SOPT2_PLLFLLSEL_MASK);
@@ -181,27 +150,32 @@ int main(void) {
     // tell usbfs where the bdt is
     USB0->BDTPAGE3 = ((uint32_t)&usb_endpoints[0]) >> 24;
     USB0->BDTPAGE2 = ((uint32_t)&usb_endpoints[0]) >> 16;
-    USB0->BDTPAGE1 = ((uint32_t)&usb_endpoints[0]) >> 8;
-
+    USB0->BDTPAGE1 = (((uint32_t)&usb_endpoints[0]) >> 8) & 0xFE;
 
     // set up usb endpoint 0 tx
-    usb_endpoints[2].buf_addr = (uint32_t)ep0_buf[0];
-    usb_endpoints[2].set.bd_ctrl = (1) | (1 << 5); // dts, own
+    usb_endpoints[2].buf_addr = (uint32_t)&self_descriptor;
+    usb_endpoints[2].set.bd_ctrl = (1 << 1) | (1 << 5); // dts, own *inside* bd_ctrl
+    usb_endpoints[2].set.bc = sizeof(struct libusb_device_descriptor);
     
-    usb_endpoints[3].buf_addr = (uint32_t)ep0_buf[1];
-    usb_endpoints[3].set.bd_ctrl = 0;
+    usb_endpoints[3].buf_addr = (uint32_t)&self_descriptor;
+    usb_endpoints[3].bd_fields = 0; 
+    usb_endpoints[3].set.bc = sizeof(struct libusb_device_descriptor);
 
     // set up usb endpoint 0 rx
+    usb_endpoints[0].buf_addr = (uint32_t)ep0_buf[0];
     usb_endpoints[0].bd_fields = 0;
-    usb_endpoints[0].buf_addr = (uint32_t)&self_descriptor;
 
+    usb_endpoints[1].buf_addr = (uint32_t)ep0_buf[1];
     usb_endpoints[1].bd_fields = 0;
-    usb_endpoints[1].buf_addr = (uint32_t)&self_descriptor;
 
     USB0->ENDPOINT[0].ENDPT = 0x0D;
+    for(int i = 1; i < 16; i++) {
+        USB0->ENDPOINT[i].ENDPT = 0; // disable all other endpoints
+    }
+
 
     // ask usbfs to interrupt us for a variety of conditions
-    USB0->INTEN |= (USB_INTEN_TOKDNEEN_MASK | /* USB_INTEN_SOFTOKEN_MASK | */ USB_INTEN_USBRSTEN_MASK | USB_INTEN_ERROREN_MASK);
+    USB0->INTEN |= (USB_INTEN_TOKDNEEN_MASK | /* USB_INTEN_SOFTOKEN_MASK | */ USB_INTEN_USBRSTEN_MASK | USB_INTEN_ERROREN_MASK | USB_INTEN_STALLEN_MASK);
 
     USB0->ERREN = 0xFF;
 
@@ -218,41 +192,74 @@ int main(void) {
     return 0;
 }
 
+void clear_stall(uint8_t stat_reg) {
+    usb_stat_t stat = (usb_stat_t)stat_reg;
+    int ep_num = stat.fields.endp;
+    // stat register is the address offset into the bdt of the affected ep
+    uint8_t bdt_idx = stat_reg >> 3;
 
-static bool usb_int_state = false;
+    // clear stall on the endpoint bit
+    USB0->ENDPOINT[ep_num].ENDPT &= ~USB_ENDPT_EPSTALL_MASK;
+
+    // clear stall in the bdt
+    if(stat.fields.tx) {
+        // tx dir stall
+        usb_endpoints[bdt_idx].set.bd_ctrl = 0;
+        // dts, own
+        usb_endpoints[bdt_idx].set.bd_ctrl = ((1 << 1) | (1 << 5));
+    }
+    else {
+        // rx dir stall
+        usb_endpoints[bdt_idx].bd_fields = 0;
+    }
+}
+
+
+bool usb_int_state = false;
+volatile uint8_t istat;
+volatile uint8_t errstat;
+volatile usb_stat_t stat;
+__attribute__((interrupt))
 void USB0_IRQHandler(void) {
-    uint8_t istat = USB0->ISTAT;
-    if(istat & USB_ISTAT_TOKDNE_MASK) {
-        USB0->ISTAT |= (USB_ISTAT_TOKDNE_MASK);
-        usb_stat_t stat = (usb_stat_t)(USB0->STAT);
-        usb_bd_t *desc = usb_endpoints + stat.fields.endp;
-        // IN token
-        /*
-         *if(desc->get.tok_pid == 0x9) {
-         *    asm("bkpt #0");
-         *}
-         */
-        // SETUP token
-        /*
-         *if(desc->get.tok_pid == 0xD) {
-         *    asm("bkpt #1");
-         *}
-         */
-        // OUT token
-        /*
-         *if(desc->get.tok_pid == 0x1) {
-         *    asm("bkpt #1");
-         *}
-         */
+    istat = USB0->ISTAT;
+    stat = (usb_stat_t)(USB0->STAT);
+    errstat = USB0->ERRSTAT;
 
+    if(errstat) {
+        asm("bkpt #0");
+    }
+
+    if(istat & USB_ISTAT_TOKDNE_MASK) {
+        uint8_t bdt_idx = stat.raw >> 3;
+        switch(usb_endpoints[bdt_idx].get.tok_pid) {
+            case 0x09:
+                // IN
+                /*asm("bkpt #0");*/
+            break;
+
+            case 0x0D:
+                // SETUP
+                asm("bkpt #1");
+            break;
+
+            case 0x01:
+                // OUT
+                /*asm("bkpt #2");*/
+            break;
+        }
         RED_LED_ON();
     }
-    if(istat & USB_ISTAT_SOFTOK_MASK) {
-        USB0->ISTAT |= (USB_ISTAT_SOFTOK_MASK);
-        /*asm("bkpt #1");*/
-    }
+
     if(istat & USB_ISTAT_USBRST_MASK) {
-        USB0->ISTAT |= (USB_ISTAT_USBRST_MASK);
+        USB0->ADDR = 0;
+		USB0->CTL |= USB_CTL_ODDRST_MASK;
+		USB0->CTL &= ~USB_CTL_ODDRST_MASK;
+        USB0->ENDPOINT[0].ENDPT = 0x0D;
+    }
+    if(istat & USB_ISTAT_STALL_MASK) {
+        // TODO handle un-stalling... why do the endpoints get stalled when
+        // they are marked as OWN and TX?
+        clear_stall(USB0->STAT);
     }
 
     // got setup packet
@@ -260,24 +267,21 @@ void USB0_IRQHandler(void) {
         // allow token processing to continue
         USB0->CTL &= ~(USB_CTL_TXSUSPENDTOKENBUSY_MASK);
         // dequeue other stuff here?
+        asm("bkpt #5");
     }
     if(USB0->ERRSTAT & USB_ERRSTAT_DMAERR_MASK) {
-        /*asm("bkpt #1");*/
+        asm("bkpt #2");
     }
-    /*
-     *if(usb_int_state) {
-     *    RED_LED_ON();
-     *}
-     *else {
-     *    RED_LED_OFF();
-     *}
-     *usb_int_state ^= 1;
-     */
+
+    // reset flags
+    USB0->ISTAT = istat;
+    USB0->ERRSTAT = errstat;
 }
 
-#define TICK_RELOAD 1000
-static int tick_counter = TICK_RELOAD;
-static bool led_state = false;
+#define TICK_RELOAD 200
+int tick_counter = TICK_RELOAD;
+bool led_state = false;
+__attribute__((interrupt))
 void SysTick_Handler(void) {
     if(tick_counter > 0) {
         tick_counter--;
@@ -290,8 +294,24 @@ void SysTick_Handler(void) {
         else {
             GREEN_LED_OFF();
         }
+
         led_state ^= 1;
     }
+}
+
+__attribute__((interrupt))
+void MemManage_Handler(void) {
+    asm("bkpt #2");
+}
+
+__attribute__((interrupt))
+void BusFault_Handler(void) {
+    asm("bkpt #3");
+}
+
+__attribute__((interrupt))
+void UsageFault_Handler(void) {
+    asm("bkpt #4");
 }
 /*
         USB0->INTEN &= ~(USB_INTEN_RESUMEEN_MASK | USB_INTEN_SLEEPEN_MASK);
