@@ -145,7 +145,7 @@ int main(void) {
     USB0->CONTROL |= (USB_CONTROL_DPPULLUPNONOTG_MASK);
 
     // set resume enable
-    USB0->USBTRC0 |= USB_USBTRC0_USBRESMEN_MASK;
+    /*USB0->USBTRC0 |= USB_USBTRC0_USBRESMEN_MASK;*/
 
     // tell usbfs where the bdt is
     USB0->BDTPAGE3 = ((uint32_t)&usb_endpoints[0]) >> 24;
@@ -173,9 +173,9 @@ int main(void) {
         USB0->ENDPOINT[i].ENDPT = 0; // disable all other endpoints
     }
 
-
     // ask usbfs to interrupt us for a variety of conditions
     USB0->INTEN |= (USB_INTEN_TOKDNEEN_MASK | /* USB_INTEN_SOFTOKEN_MASK | */ USB_INTEN_USBRSTEN_MASK | USB_INTEN_ERROREN_MASK | USB_INTEN_STALLEN_MASK);
+    USB0->OTGICR = 0; // disable otg interrupts
 
     USB0->ERREN = 0xFF;
 
@@ -184,8 +184,9 @@ int main(void) {
 
     // turn on the usbfs module
     USB0->CTL |= (USB_CTL_USBENSOFEN_MASK);
-    
+
     NVIC_SetPriority(USB0_IRQn, 0);
+    NVIC_ClearPendingIRQ(USB0_IRQn);
     NVIC_EnableIRQ(USB0_IRQn);
     asm("cpsie i");
     for(;;);
@@ -224,6 +225,7 @@ void USB0_IRQHandler(void) {
     istat = USB0->ISTAT;
     stat = (usb_stat_t)(USB0->STAT);
     errstat = USB0->ERRSTAT;
+    USB0->OTGISTAT |= 0xff; // clear OTG flags which don't appear to have enables
 
     if(errstat) {
         asm("bkpt #0");
