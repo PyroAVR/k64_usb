@@ -120,7 +120,35 @@ int main(void) {
 
     SCB->SHCSR |= (SCB_SHCSR_MEMFAULTENA_Msk | SCB_SHCSR_BUSFAULTENA_Msk | SCB_SHCSR_USGFAULTENA_Msk);
 
-    // forcibly toggle USBFS power to ensure sane debugging
+    // AXBS / CROSSBAR CONFIG
+    // USBFS is Bus Master #4 on K64 (TRM 3.3.6.1)
+    // FLASH controller is slave 0, SRAM backdoor is slave 1.
+    // AIPSx_MPRA resets to 0x77700000, only ARM (ID)CODE, ARM SYS, and DMA are
+    // "trusted" on boot. (TRM 3.3.8.3)
+    // Why is it called backdoor?: TRM 3.5.3.3, M4 core gets its own direct access,
+    // allowing for TCM to be built into the M4 even though it does not support that
+    // officially from ARM
+    //
+    // AIPS / PERIPHERAL BRIDGE CONFIG
+    // Flash memory is slot 32.
+    // USBFS is slot 114.
+    //
+    // See TRM 3.3.6 for a graphical representation of the AXBS ports.
+    // allow USBFS to read / write to anywhere in the address space. (no granularity)
+    AIPS0->MPRA |= (AIPS_MPRA_MTR4_MASK | AIPS_MPRA_MTW4_MASK | AIPS_MPRA_MPL4_MASK);
+    AIPS1->MPRA |= (AIPS_MPRA_MTR4_MASK | AIPS_MPRA_MTW4_MASK | AIPS_MPRA_MPL4_MASK);
+    // ARM CODE and SYSTEM buses have lowest priority on SRAM backdoor
+    // (should be using front door anyway)
+    // can't write fields at once: two masters may not have the same prio at any time.
+    AXBS->SLAVE[1].PRS |= AXBS_PRS_M0_MASK;
+    AXBS->SLAVE[1].PRS &= ~AXBS_PRS_M1_MASK;
+    AXBS->SLAVE[1].PRS |= (6 << 4); // priority 6 on M1 -> S1
+    // USBFS has highest priority (0) on SRAM backdoor
+    AXBS->SLAVE[1].PRS &= ~AXBS_PRS_M4_MASK;
+    // allow USBFS to be interrupted after 1 "beat" in burst transfers.
+    AXBS->MGPCR4 = 1;
+    AXBS->SLAVE[1].CRS |= (1 << AXBS_CRS_ARB_SHIFT);
+
     SIM->SCGC4 &= ~SIM_SCGC4_USBOTG_MASK;
 
     // use USB 48MHz ref clock for PLL/FLL
@@ -129,7 +157,8 @@ int main(void) {
     SIM->SOPT2 |= (SIM_SOPT2_USBSRC_MASK);
 
     // turn off MPU since apparently it conflicts with USB (mcuoneclipse dude)
-    SIM->SCGC7 &= ~(SIM_SCGC7_MPU_MASK);
+    /*SIM->SCGC7 &= ~(SIM_SCGC7_MPU_MASK);*/
+    SYSMPU->CESR &= ~1;
 
     SIM->CLKDIV2 &= ~(SIM_CLKDIV2_USBDIV_MASK);
 
@@ -164,9 +193,14 @@ int main(void) {
     // set up usb endpoint 0 rx
     usb_endpoints[0].buf_addr = (uint32_t)ep0_buf[0];
     usb_endpoints[0].bd_fields = 0;
+    usb_endpoints[0].set.bc = 64;
+    // dts, own
+    usb_endpoints[0].set.bd_ctrl |= ((1 << 1) | (1 << 5));
 
     usb_endpoints[1].buf_addr = (uint32_t)ep0_buf[1];
     usb_endpoints[1].bd_fields = 0;
+    usb_endpoints[1].set.bc = 64;
+    usb_endpoints[1].set.bd_ctrl |= ((1 << 1) | (1 << 5));
 
     USB0->ENDPOINT[0].ENDPT = 0x0D;
     for(int i = 1; i < 16; i++) {
